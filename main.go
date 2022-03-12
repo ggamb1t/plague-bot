@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -29,10 +30,11 @@ type RequestSecureInfo struct {
 }
 
 type CheckResponse struct {
-	Response CheckResponseResponse `json:"response"`
+	Response CheckResponseResponse `json:"reponse"`
 }
 type CheckResponseResponse struct {
-	RequestId int64 `json:"requestId"`
+	Error     ErrorResponse `json:"error"`
+	RequestId int64         `json:"requestId"`
 }
 
 type PollRequest struct {
@@ -49,13 +51,19 @@ type PollRequestBody struct {
 }
 
 type PollResponse struct {
-	Response PollResponseResponse `json:"response"`
+	Response PollResponseResponse `json:"reponse"`
 }
 type PollResponseResponse struct {
+	Error  ErrorResponse      `json:"error"`
 	Result PollResponseResult `json:"result"`
 }
 type PollResponseResult struct {
 	OriginalityRating float64 `json:"originality_rating"`
+}
+
+type ErrorResponse struct {
+	Code    int32  `json:"code"`
+	Message string `json:"message"`
 }
 
 const (
@@ -69,17 +77,33 @@ type UserCommand struct {
 	File    string
 }
 
+type Secrets struct {
+	BotToken           string `json:"botToken"`
+	SecureInfoLogin    string `json:"secureInfoLogin"`
+	SecureInfoPassword string `json:"secureInfoPassword"`
+	AntiPlagiatSite    string `json:"antiPlagiatSite"`
+}
+
 func main() {
-	const botToken = ""
-	const secureInfoLogin = ""
-	const secureInfoPassword = ""
-	const antiPlagiatSite = ""
-	secureInfo := &RequestSecureInfo{
-		Login:    secureInfoLogin,
-		Password: secureInfoPassword,
+	file, err := os.Open("secret.json")
+	if err != nil {
+		log.Panic(err)
+	}
+	defer file.Close()
+
+	decoder := json.NewDecoder(file)
+	var secrets Secrets
+	err = decoder.Decode(&secrets)
+	if err != nil {
+		log.Panic(err)
 	}
 
-	bot, err := tgbotapi.NewBotAPI("MyAwesomeBotToken")
+	secureInfo := &RequestSecureInfo{
+		Login:    secrets.SecureInfoLogin,
+		Password: secrets.SecureInfoPassword,
+	}
+
+	bot, err := tgbotapi.NewBotAPI(secrets.BotToken)
 	if err != nil {
 		log.Panic(err)
 	}
@@ -97,9 +121,9 @@ func main() {
 		if update.Message != nil { // If we got a message
 			log.Printf("[%s] %s", update.Message.From.UserName, update.Message.Text)
 
-			messageToSend, requestId, err := handleMessage(secureInfo, antiPlagiatSite, update.Message)
+			messageToSend, requestId, err := handleMessage(secureInfo, secrets.AntiPlagiatSite, update.Message)
 			if err != nil {
-				msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Incorrect command")
+				msg := tgbotapi.NewMessage(update.Message.Chat.ID, err.Error())
 				msg.ReplyToMessageID = update.Message.MessageID
 
 				bot.Send(msg)
@@ -107,7 +131,7 @@ func main() {
 			}
 			bot.Send(messageToSend)
 
-			go pollResult(requestId, secureInfo, antiPlagiatSite, bot, update.Message)
+			go pollResult(requestId, secureInfo, secrets.AntiPlagiatSite, bot, update.Message)
 		}
 	}
 }
@@ -136,6 +160,9 @@ func handleMessage(secureInfo *RequestSecureInfo, antiPlagiatSite string, messag
 			return nil, 0, fmt.Errorf("couldn't parse request to json %w", err)
 		}
 		request, err := http.NewRequest("POST", antiPlagiatSite, bytes.NewBuffer(requestJson))
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to create request %w", err)
+		}
 		request.Header.Set("Content-Type", "application/json; charset=UTF-8")
 
 		client := &http.Client{}
@@ -149,12 +176,18 @@ func handleMessage(secureInfo *RequestSecureInfo, antiPlagiatSite string, messag
 			return nil, 0, fmt.Errorf("status code != 200")
 		}
 
-		checkResponseJson, _ := ioutil.ReadAll(response.Body)
+		checkResponseJson, err := ioutil.ReadAll(response.Body)
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to read body %w", err)
+		}
 
 		var resp CheckResponse
 		err = json.Unmarshal(checkResponseJson, &resp)
 		if err != nil {
 			return nil, 0, fmt.Errorf("couldn't unparse %w", err)
+		}
+		if resp.Response.Error.Code != 0 {
+			return nil, 0, fmt.Errorf("error from server: %s", resp.Response.Error.Message)
 		}
 
 		msg := tgbotapi.NewMessage(message.Chat.ID, message.Text)
@@ -180,14 +213,17 @@ func pollResult(requestId int64, secureInfo *RequestSecureInfo, antiPlagiatSite 
 		return
 	}
 	request, err := http.NewRequest("POST", antiPlagiatSite, bytes.NewBuffer(requestJson))
+	if err != nil {
+		log.Printf("%s", err)
+	}
 	request.Header.Set("Content-Type", "application/json; charset=UTF-8")
 
 	client := &http.Client{}
 
 	for attemptCount := 0; attemptCount < 5; attemptCount++ {
 		time.Sleep(10 * time.Second)
-		response, err1 := client.Do(request)
-		if err1 != nil {
+		response, err := client.Do(request)
+		if err != nil {
 			continue
 		}
 		if response.StatusCode != 200 {
@@ -200,6 +236,9 @@ func pollResult(requestId int64, secureInfo *RequestSecureInfo, antiPlagiatSite 
 		var resp PollResponse
 		err = json.Unmarshal(checkResponseJson, &resp)
 		if err != nil {
+			continue
+		}
+		if resp.Response.Error.Code != 0 {
 			continue
 		}
 
