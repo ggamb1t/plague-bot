@@ -82,6 +82,15 @@ const (
 	DeleteResult    = "delresult"
 )
 
+const (
+	retryCount = 5
+)
+
+const (
+	commandStart = "/start"
+	commandCheck = "/check"
+)
+
 type UserCommand struct {
 	Command  string
 	Year     int32
@@ -143,15 +152,24 @@ func main() {
 			}
 			bot.Send(messageToSend)
 
-			go pollResult(requestId, secureInfo, secrets.AntiPlagiatSite, bot, update.Message)
+			if requestId != 0 {
+				go pollResult(requestId, secureInfo, secrets.AntiPlagiatSite, bot, update.Message)
+			}
 		}
 	}
 }
 
 func getUserCommand(message *tgbotapi.Message) (*UserCommand, error) {
 	messageParts := strings.Split(message.Text, " ")
-	if messageParts[0] != "/check" {
+
+	if !contains(getCommands(), messageParts[0]) {
 		return nil, fmt.Errorf("incorrect command")
+	}
+	if messageParts[0] == commandStart {
+		res := &UserCommand{
+			Command: commandStart,
+		}
+		return res, nil
 	}
 	year, err := strconv.Atoi(messageParts[1])
 	if err != nil {
@@ -161,7 +179,7 @@ func getUserCommand(message *tgbotapi.Message) (*UserCommand, error) {
 	file := base64.StdEncoding.EncodeToString(bytes.NewBufferString(strings.Join(messageParts[3:], " ")).Bytes())
 
 	res := &UserCommand{
-		Command:  messageParts[0],
+		Command:  commandCheck,
 		Year:     int32(year),
 		Filename: messageParts[2],
 		File:     file,
@@ -173,6 +191,11 @@ func handleMessage(secureInfo *RequestSecureInfo, antiPlagiatSite string, messag
 	command, err := getUserCommand(message)
 	if err != nil {
 		return nil, 0, err
+	}
+	if command.Command == commandStart {
+		msg := tgbotapi.NewMessage(message.Chat.ID, "/check year filename text\nExample:\n/check 2022 diplom.txt Hello Exa")
+		msg.ReplyToMessageID = message.MessageID
+		return &msg, 0, nil
 	}
 	requestJson, err := json.Marshal(&CheckRequest{
 		Request: CheckRequestRequest{
@@ -249,7 +272,7 @@ func pollResult(requestId int64, secureInfo *RequestSecureInfo, antiPlagiatSite 
 
 	client := &http.Client{}
 
-	for attemptCount := 0; attemptCount < 5; attemptCount++ {
+	for attemptCount := 0; attemptCount < retryCount; attemptCount++ {
 		time.Sleep(10 * time.Second)
 		response, err := client.Do(request)
 		if err != nil {
@@ -288,4 +311,21 @@ func pollResult(requestId int64, secureInfo *RequestSecureInfo, antiPlagiatSite 
 	msg.ReplyToMessageID = message.MessageID
 
 	bot.Send(msg)
+}
+
+func getCommands() []string {
+	return []string{
+		commandStart,
+		commandCheck,
+	}
+}
+
+func contains(s []string, searchterm string) bool {
+	found := false
+	for _, s2 := range s {
+		if s2 == searchterm {
+			found = true
+		}
+	}
+	return found
 }
