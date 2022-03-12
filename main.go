@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -9,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -22,7 +24,15 @@ type CheckRequestRequest struct {
 	SecureInfo RequestSecureInfo `json:"secureinfo"`
 }
 type CheckRequestBody struct {
-	File string `json:"file"`
+	Document   CheckRequestBodyDocument   `json:"doc"`
+	Parameters CheckRequestBodyParameters `json:"parameters"`
+}
+type CheckRequestBodyDocument struct {
+	Filename string `json:"filename"`
+	Body     string `json:"body"`
+}
+type CheckRequestBodyParameters struct {
+	Year int32 `json:"year"`
 }
 type RequestSecureInfo struct {
 	Login    string `json:"login"`
@@ -73,8 +83,10 @@ const (
 )
 
 type UserCommand struct {
-	Command string
-	File    string
+	Command  string
+	Year     int32
+	Filename string
+	File     string
 }
 
 type Secrets struct {
@@ -136,66 +148,83 @@ func main() {
 	}
 }
 
-func getUserCommand(message string) *UserCommand {
-	messageParts := strings.Split(message, " ")
-	res := &UserCommand{
-		Command: messageParts[0],
-		File:    strings.Join(messageParts[1:], " "),
+func getUserCommand(message *tgbotapi.Message) (*UserCommand, error) {
+	messageParts := strings.Split(message.Text, " ")
+	if messageParts[0] != "/check" {
+		return nil, fmt.Errorf("incorrect command")
 	}
-	return res
+	year, err := strconv.Atoi(messageParts[1])
+	if err != nil {
+		return nil, err
+	}
+
+	file := base64.StdEncoding.EncodeToString(bytes.NewBufferString(strings.Join(messageParts[3:], " ")).Bytes())
+
+	res := &UserCommand{
+		Command:  messageParts[0],
+		Year:     int32(year),
+		Filename: messageParts[2],
+		File:     file,
+	}
+	return res, nil
 }
 
 func handleMessage(secureInfo *RequestSecureInfo, antiPlagiatSite string, message *tgbotapi.Message) (*tgbotapi.MessageConfig, int64, error) {
-	command := getUserCommand(message.Text)
-	if command.Command == "/check" {
-		requestJson, err := json.Marshal(&CheckRequest{
-			Request: CheckRequestRequest{
-				Method: SendFileToCheck,
-				Body: CheckRequestBody{
-					File: command.File,
-				},
-				SecureInfo: *secureInfo,
-			}})
-		if err != nil {
-			return nil, 0, fmt.Errorf("couldn't parse request to json %w", err)
-		}
-		request, err := http.NewRequest("POST", antiPlagiatSite, bytes.NewBuffer(requestJson))
-		if err != nil {
-			return nil, 0, fmt.Errorf("failed to create request %w", err)
-		}
-		request.Header.Set("Content-Type", "application/json; charset=UTF-8")
-
-		client := &http.Client{}
-		response, err := client.Do(request)
-		if err != nil {
-			return nil, 0, fmt.Errorf("http error %w", err)
-		}
-		defer response.Body.Close()
-
-		if response.StatusCode != 200 {
-			return nil, 0, fmt.Errorf("status code != 200")
-		}
-
-		checkResponseJson, err := ioutil.ReadAll(response.Body)
-		if err != nil {
-			return nil, 0, fmt.Errorf("failed to read body %w", err)
-		}
-
-		var resp CheckResponse
-		err = json.Unmarshal(checkResponseJson, &resp)
-		if err != nil {
-			return nil, 0, fmt.Errorf("couldn't unparse %w", err)
-		}
-		if resp.Response.Error.Code != 0 {
-			return nil, 0, fmt.Errorf("error from server: %s", resp.Response.Error.Message)
-		}
-
-		msg := tgbotapi.NewMessage(message.Chat.ID, message.Text)
-		msg.ReplyToMessageID = message.MessageID
-		return &msg, resp.Response.RequestId, nil
-	} else {
-		return nil, 0, fmt.Errorf("incorrect command")
+	command, err := getUserCommand(message)
+	if err != nil {
+		return nil, 0, err
 	}
+	requestJson, err := json.Marshal(&CheckRequest{
+		Request: CheckRequestRequest{
+			Method: SendFileToCheck,
+			Body: CheckRequestBody{
+				Document: CheckRequestBodyDocument{
+					Filename: command.Filename,
+					Body:     command.File,
+				},
+				Parameters: CheckRequestBodyParameters{
+					Year: command.Year,
+				},
+			},
+			SecureInfo: *secureInfo,
+		}})
+	if err != nil {
+		return nil, 0, fmt.Errorf("couldn't parse request to json %w", err)
+	}
+	request, err := http.NewRequest("POST", antiPlagiatSite, bytes.NewBuffer(requestJson))
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to create request %w", err)
+	}
+	request.Header.Set("Content-Type", "application/json; charset=UTF-8")
+
+	client := &http.Client{}
+	response, err := client.Do(request)
+	if err != nil {
+		return nil, 0, fmt.Errorf("http error %w", err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != 200 {
+		return nil, 0, fmt.Errorf("status code != 200")
+	}
+
+	checkResponseJson, err := ioutil.ReadAll(response.Body)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to read body %w", err)
+	}
+
+	var resp CheckResponse
+	err = json.Unmarshal(checkResponseJson, &resp)
+	if err != nil {
+		return nil, 0, fmt.Errorf("couldn't unparse %w", err)
+	}
+	if resp.Response.Error.Code != 0 {
+		return nil, 0, fmt.Errorf("error from server: %s", resp.Response.Error.Message)
+	}
+
+	msg := tgbotapi.NewMessage(message.Chat.ID, message.Text)
+	msg.ReplyToMessageID = message.MessageID
+	return &msg, resp.Response.RequestId, nil
 }
 
 func pollResult(requestId int64, secureInfo *RequestSecureInfo, antiPlagiatSite string, bot *tgbotapi.BotAPI, message *tgbotapi.Message) {
@@ -244,7 +273,10 @@ func pollResult(requestId int64, secureInfo *RequestSecureInfo, antiPlagiatSite 
 
 		response.Body.Close()
 
-		msg := tgbotapi.NewMessage(message.Chat.ID, fmt.Sprintf("%f", resp.Response.Result.OriginalityRating))
+		msg := tgbotapi.NewMessage(message.Chat.ID, fmt.Sprintf(
+			"request id: %d\noriginality rating: %f",
+			requestId,
+			resp.Response.Result.OriginalityRating))
 		msg.ReplyToMessageID = message.MessageID
 
 		bot.Send(msg)
